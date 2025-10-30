@@ -9,8 +9,7 @@ Single-file reference implementation with dynamic controls (from `v4l2-ctl`), FP
 ---
 
 ## Quick links
-- Single-file python: 'USBcam.py'
-- Single-file executable GUI: `/Dist/USBcam`
+- Single-file python: 'USBcam.py' # Go for the Patch code by RadinRein for updated GUI
 - Supported platforms: Linux (full features with `v4l2-ctl`)
 - Recommended: use with UVC cameras and V4L2-compatible drivers on Linux
 
@@ -38,3 +37,9 @@ Single-file reference implementation with dynamic controls (from `v4l2-ctl`), FP
 Install Python packages:
 ```bash/Terminal
 pip install -r requirements.txt
+
+# P.S. This code USBcam.py is made for Linux system. User can make a Desktop App image for their Linux OS using pyinstaller, which goes like :
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile USBcam.py
+
+#The created app image will be in a folder /dist/USBcam
