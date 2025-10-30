@@ -1,27 +1,4 @@
-#!/usr/bin/env python3
-"""
-USBcam.py
-
-PyQt6 GUI for controlling a V4L2 / UVC camera with dynamic controls, FPS, burst capture,
-selectable save folder, and **user-definable filename pattern**.
-
-Filename pattern tokens:
-  {timestamp}                    -> current time using default "%Y%m%d_%H%M%S"
-  {timestamp:%Y-%m-%d_%H-%M-%S}  -> timestamp with custom strftime format
-  {index}                        -> frame index in burst (0..N-1)
-  {index:03d}                    -> index with format spec (Python format spec)
-  {count}                        -> total count
-  {exposure}                     -> exposure (if available) else "NA"
-  {gain}                         -> gain (if available) else "NA"
-
-Examples:
-  capture_{timestamp}.jpg
-  burst_{timestamp}_{index:03d}.jpg
-  img_{timestamp:%Y%m%d}_{index:02d}_exp{exposure}.png
-
-Usage:
-    python3 USBcam.py
-"""
+#This code is the property of RadinRein
 import sys
 import os
 import re
@@ -34,7 +11,15 @@ import cv2
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-# ---------- helper (v4l2-ctl wrappers, parsing) ----------
+# optional dependency for GIF writing
+try:
+    import imageio
+    _HAS_IMAGEIO = True
+except Exception:
+    imageio = None
+    _HAS_IMAGEIO = False
+
+# ----------------- helpers for subprocess / v4l2-ctl -----------------
 def run_cmd(cmd: List[str]) -> str:
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -90,7 +75,7 @@ def parse_ctrls(raw: str) -> Dict[str, Dict[str, Any]]:
     if not raw:
         return controls
     line_re = re.compile(r'^\s*(?P<name>[^\(]+?)\s+[0-9xa-fA-F_]+\s*\((?P<type>[^)]+)\)\s*:\s*(?P<rest>.*)$')
-    kv_re = re.compile(r'([a-zA-Z0-9_]+)=([^\s]+)')
+    kv_re = re.compile(r'([a-zA-Z0-9_]+)=([^\s,]+)')
     value_label_re = re.compile(r'value=(\d+)\s*\(([^)]+)\)')
     for line in raw.splitlines():
         m = line_re.match(line)
@@ -130,7 +115,7 @@ def set_framerate_v4l2(dev: str, fps: int) -> bool:
     out = run_cmd(cmd)
     return out is not None
 
-# ---------- Camera worker ----------
+# ----------------- camera worker -----------------
 class CameraWorker(QtCore.QObject):
     frame_ready = QtCore.pyqtSignal(np.ndarray)
     error = QtCore.pyqtSignal(str)
@@ -179,39 +164,100 @@ class CameraWorker(QtCore.QObject):
             return
         self.frame_ready.emit(frame)
 
-# ---------- MainWindow ----------
+# ----------------- GIF saver worker (QThread) -----------------
+class GifSaverWorker(QtCore.QThread):
+    progress = QtCore.pyqtSignal(int, int)  # current, total
+    finished = QtCore.pyqtSignal(bool, str)  # success, message
+
+    def __init__(self, frames: List[np.ndarray], path: str, fps: int = 15, parent=None):
+        super().__init__(parent)
+        self.frames = frames
+        self.path = path
+        self.fps = fps
+
+    def run(self):
+        try:
+            total = len(self.frames)
+            with imageio.get_writer(self.path, fps=self.fps) as writer:
+                for i, frame in enumerate(self.frames):
+                    writer.append_data(frame)
+                    self.progress.emit(i + 1, total)
+            self.finished.emit(True, f"GIF saved: {self.path}")
+        except Exception as e:
+            self.finished.emit(False, f"Failed to save GIF: {e}")
+
+# ----------------- MainWindow -----------------
 class MainWindow(QtWidgets.QMainWindow):
+    SETTINGS_ORG = "usbcam_app"
+    SETTINGS_APP = "usbcam_gui"
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IMX335 Camera GUI (pattern filenames)")
-        self.resize(1250, 820)
+        self._init_size_from_screen()
+        self.setWindowTitle("IMX335 Camera GUI (resizable)")
         self._build_ui()
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self._on_timer)
+
+        # state
+        self.timer = QtCore.QTimer(); self.timer.timeout.connect(self._on_timer)
         self.worker: Optional[CameraWorker] = None
         self.current_frame: Optional[np.ndarray] = None
-        self._ctrl_widgets = {}  # norm_key -> meta dict
-
-        # burst state
+        self._ctrl_widgets: Dict[str, Dict[str, Any]] = {}
+        self._last_ctrls: Dict[str, Dict[str, Any]] = {}
         self._burst_timer: Optional[QtCore.QTimer] = None
         self._burst_remaining = 0
         self._burst_prefix = ""
 
-        # default save folder
-        self.save_folder = os.getcwd()
-        self.le_save_folder.setText(self.save_folder)
+        # recording state
+        self.recording = False
+        self.rec_format = "mp4"
+        self.rec_writer = None
+        self.rec_frames: List[np.ndarray] = []
+        self.rec_path = ""
+        self.rec_start_time = None
+        self.rec_timer = QtCore.QTimer(); self.rec_timer.setInterval(500); self.rec_timer.timeout.connect(self._on_record_tick)
+        self.gif_worker: Optional[GifSaverWorker] = None
 
-        # default pattern
-        self.le_pattern.setText("capture_{timestamp:%Y%m%d_%H%M%S}.jpg")
+        # QSettings
+        self.settings = QtCore.QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        self._load_settings()
+
+        # defaults & restore
+        self.save_folder = os.path.expanduser(self.settings.value("save_folder", os.getcwd()))
+        self.le_save_folder.setText(self.save_folder)
+        self.le_pattern.setText(self.settings.value("file_pattern", "capture_{timestamp:%Y%m%d_%H%M%S}.jpg"))
+        self.le_record_pattern.setText(self.settings.value("record_pattern", "recording_{timestamp:%Y%m%d_%H%M%S}.mp4"))
+        self.rec_format_combo.setCurrentText(self.settings.value("record_format", "mp4"))
+        self.fps_spin.setValue(int(self.settings.value("fps", 30)))
 
         self._populate_devices()
 
+    def _init_size_from_screen(self):
+        """
+        Set an initial window size based on available screen geometry.
+        Default fraction is 0.85 (85%) of available width and height.
+        """
+        app = QtWidgets.QApplication.instance()
+        # In some contexts (tests), QApplication may not exist yet; guard.
+        if app is None:
+            return
+        screen = app.primaryScreen()
+        if not screen:
+            return
+        avail = screen.availableGeometry()
+        frac = 0.85
+        w = max(800, int(avail.width() * frac))
+        h = max(600, int(avail.height() * frac))
+        self.resize(w, h)
+        # Set a reasonable minimum so layout doesn't collapse
+        self.setMinimumSize(700, 500)
+
+    # ----------------- UI -----------------
     def _build_ui(self):
         w = QtWidgets.QWidget()
         self.setCentralWidget(w)
         main_layout = QtWidgets.QVBoxLayout(w)
 
-        # top row: device/resolution/preview
+        # device/resolution controls
         top = QtWidgets.QHBoxLayout()
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.currentIndexChanged.connect(self._on_device_selected)
         top.addWidget(QtWidgets.QLabel("Device:")); top.addWidget(self.device_combo)
@@ -221,34 +267,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stop = QtWidgets.QPushButton("Stop Preview"); self.btn_stop.clicked.connect(self._on_stop_clicked); self.btn_stop.setEnabled(False); top.addWidget(self.btn_stop)
         main_layout.addLayout(top)
 
-        # middle
-        mid = QtWidgets.QHBoxLayout()
-        # preview
-        self.video_label = QtWidgets.QLabel(); self.video_label.setMinimumSize(640,480); self.video_label.setStyleSheet("background-color: black;"); self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        mid.addWidget(self.video_label, stretch=1)
+        # Instead of simple HBox, use a QSplitter so preview and control side can be resized by user
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
-        # right column controls
-        right = QtWidgets.QVBoxLayout()
+        # preview area (left)
+        preview_container = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview_container)
+        self.video_label = QtWidgets.QLabel()
+        self.video_label.setStyleSheet("background-color: black;")
+        self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        # Make video_label expand/contract with the splitter/window
+        self.video_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        preview_layout.addWidget(self.video_label)
+        splitter.addWidget(preview_container)
 
-        # frame rate group
+        # right-side controls (put all right column widgets inside this widget)
+        right_widget = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_widget)
+
+        # Frame Rate group
         fr_group = QtWidgets.QGroupBox("Frame Rate Control")
         fr_layout = QtWidgets.QHBoxLayout(fr_group)
         fr_layout.addWidget(QtWidgets.QLabel("FPS:"))
-        self.fps_spin = QtWidgets.QSpinBox(); self.fps_spin.setRange(1,240); self.fps_spin.setValue(30); fr_layout.addWidget(self.fps_spin)
+        self.fps_spin = QtWidgets.QSpinBox(); self.fps_spin.setRange(1, 240); self.fps_spin.setValue(30); fr_layout.addWidget(self.fps_spin)
         self.btn_set_fps = QtWidgets.QPushButton("Set FPS"); self.btn_set_fps.clicked.connect(self._on_set_fps); fr_layout.addWidget(self.btn_set_fps)
         self.lbl_fps_status = QtWidgets.QLabel(""); fr_layout.addWidget(self.lbl_fps_status, stretch=1)
-        right.addWidget(fr_group)
+        right_layout.addWidget(fr_group)
 
-        # burst group
+        # Burst group
         burst_group = QtWidgets.QGroupBox("Burst Capture")
         burst_layout = QtWidgets.QGridLayout(burst_group)
-        burst_layout.addWidget(QtWidgets.QLabel("Count:"),0,0); self.burst_count_spin = QtWidgets.QSpinBox(); self.burst_count_spin.setRange(1,1000); self.burst_count_spin.setValue(5); burst_layout.addWidget(self.burst_count_spin,0,1)
-        burst_layout.addWidget(QtWidgets.QLabel("Interval (ms):"),1,0); self.burst_interval_spin = QtWidgets.QSpinBox(); self.burst_interval_spin.setRange(10,60000); self.burst_interval_spin.setValue(200); burst_layout.addWidget(self.burst_interval_spin,1,1)
-        self.btn_start_burst = QtWidgets.QPushButton("Start Burst Capture"); self.btn_start_burst.clicked.connect(self._on_start_burst); burst_layout.addWidget(self.btn_start_burst,2,0,1,2)
-        self.lbl_burst_status = QtWidgets.QLabel(""); burst_layout.addWidget(self.lbl_burst_status,3,0,1,2)
-        right.addWidget(burst_group)
+        burst_layout.addWidget(QtWidgets.QLabel("Count:"), 0, 0); self.burst_count_spin = QtWidgets.QSpinBox(); self.burst_count_spin.setRange(1, 1000); self.burst_count_spin.setValue(5); burst_layout.addWidget(self.burst_count_spin, 0, 1)
+        burst_layout.addWidget(QtWidgets.QLabel("Interval (ms):"), 1, 0); self.burst_interval_spin = QtWidgets.QSpinBox(); self.burst_interval_spin.setRange(10, 60000); self.burst_interval_spin.setValue(200); burst_layout.addWidget(self.burst_interval_spin, 1, 1)
+        self.btn_start_burst = QtWidgets.QPushButton("Start Burst Capture"); self.btn_start_burst.clicked.connect(self._on_start_burst); burst_layout.addWidget(self.btn_start_burst, 2, 0, 1, 2)
+        self.lbl_burst_status = QtWidgets.QLabel(""); burst_layout.addWidget(self.lbl_burst_status, 3, 0, 1, 2)
+        right_layout.addWidget(burst_group)
 
-        # save folder group
+        # Save folder & pattern
         save_group = QtWidgets.QGroupBox("Save Folder & Filename Pattern")
         save_layout = QtWidgets.QVBoxLayout(save_group)
         row = QtWidgets.QHBoxLayout()
@@ -256,44 +312,89 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_browse = QtWidgets.QPushButton("Browse"); self.btn_browse.clicked.connect(self._on_browse_folder); row.addWidget(self.btn_browse)
         self.btn_open_folder = QtWidgets.QPushButton("Open"); self.btn_open_folder.clicked.connect(self._on_open_folder); row.addWidget(self.btn_open_folder)
         save_layout.addLayout(row)
-        # pattern input
         save_layout.addWidget(QtWidgets.QLabel("Filename pattern:"))
         self.le_pattern = QtWidgets.QLineEdit()
         self.le_pattern.setToolTip("Use tokens like {timestamp}, {timestamp:%Y%m%d_%H%M%S}, {index}, {index:03d}, {count}, {exposure}, {gain}")
         save_layout.addWidget(self.le_pattern)
-        # example label
         self.lbl_pattern_example = QtWidgets.QLabel("Example: capture_{timestamp}_{index:03d}.jpg")
         save_layout.addWidget(self.lbl_pattern_example)
-        right.addWidget(save_group)
+        right_layout.addWidget(save_group)
 
         # dynamic controls area (scroll)
         self.ctrl_scroll = QtWidgets.QScrollArea(); self.ctrl_scroll.setWidgetResizable(True)
         self.ctrl_container = QtWidgets.QWidget(); self.ctrl_layout = QtWidgets.QVBoxLayout(self.ctrl_container); self.ctrl_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self.ctrl_scroll.setWidget(self.ctrl_container)
-        right.addWidget(self.ctrl_scroll, stretch=1)
+        # let the scroll area expand vertically as the window grows
+        self.ctrl_scroll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        right_layout.addWidget(self.ctrl_scroll, stretch=1)
 
-        # save single frame
+        # actions: save frame + reset to hardware defaults
+        actions_row = QtWidgets.QHBoxLayout()
         self.btn_save = QtWidgets.QPushButton("Save Frame"); self.btn_save.clicked.connect(self._on_save_frame); self.btn_save.setEnabled(False)
-        right.addWidget(self.btn_save)
+        actions_row.addWidget(self.btn_save)
+        self.btn_reset_defaults = QtWidgets.QPushButton("Reset to hardware defaults"); self.btn_reset_defaults.clicked.connect(self._on_reset_to_defaults)
+        actions_row.addWidget(self.btn_reset_defaults)
+        right_layout.addLayout(actions_row)
 
-        right.addStretch(1)
-        mid.addLayout(right, stretch=0)
-        main_layout.addLayout(mid)
+        # Recording group (enhanced)
+        rec_group = QtWidgets.QGroupBox("Recording")
+        rec_layout = QtWidgets.QGridLayout(rec_group)
+        rec_layout.addWidget(QtWidgets.QLabel("Format:"), 0, 0)
+        self.rec_format_combo = QtWidgets.QComboBox()
+        self.rec_format_combo.addItem("mp4"); self.rec_format_combo.addItem("avi"); self.rec_format_combo.addItem("gif")
+        rec_layout.addWidget(self.rec_format_combo, 0, 1)
+        rec_layout.addWidget(QtWidgets.QLabel("Filename pattern:"), 1, 0)
+        self.le_record_pattern = QtWidgets.QLineEdit()
+        rec_layout.addWidget(self.le_record_pattern, 1, 1)
+        self.btn_record = QtWidgets.QPushButton("Start Recording")
+        self.btn_record.clicked.connect(self._on_record_toggle)
+        rec_layout.addWidget(self.btn_record, 2, 0, 1, 2)
+        self.lbl_record_status = QtWidgets.QLabel("")
+        rec_layout.addWidget(self.lbl_record_status, 3, 0, 1, 2)
+        hrow = QtWidgets.QHBoxLayout()
+        self.lbl_rec_duration = QtWidgets.QLabel("Duration: 00:00:00")
+        self.lbl_rec_filesize = QtWidgets.QLabel("Size: 0 B")
+        self.lbl_rec_est = QtWidgets.QLabel("Est: 0 B")
+        hrow.addWidget(self.lbl_rec_duration); hrow.addWidget(self.lbl_rec_filesize); hrow.addWidget(self.lbl_rec_est)
+        rec_layout.addLayout(hrow, 4, 0, 1, 2)
+        right_layout.addWidget(rec_group)
+
+        right_layout.addStretch(1)
+        splitter.addWidget(right_widget)
+
+        # set initial splitter sizes (left larger than right)
+        splitter.setSizes([int(self.width() * 0.65), int(self.width() * 0.35)])
+
+        main_layout.addWidget(splitter, stretch=1)
 
         # bottom status
         self.status = QtWidgets.QLabel("")
         main_layout.addWidget(self.status)
 
-    # ---- devices/formats ----
+    # ----------------- settings -----------------
+    def _load_settings(self):
+        s = QtCore.QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        return s
+
+    def _save_settings(self):
+        s = self.settings
+        s.setValue("save_folder", self.le_save_folder.text().strip() or "")
+        s.setValue("file_pattern", self.le_pattern.text().strip() or "")
+        s.setValue("record_pattern", self.le_record_pattern.text().strip() or "")
+        s.setValue("record_format", self.rec_format_combo.currentText())
+        s.setValue("fps", int(self.fps_spin.value()))
+        s.sync()
+
+    # ----------------- device enumeration -----------------
     def _populate_devices(self):
         self.device_combo.clear()
         if not v4l2_available():
-            self.device_combo.addItem("/dev/video0 (v4l2-ctl not found)","/dev/video0")
+            self.device_combo.addItem("/dev/video0 (v4l2-ctl not found)", "/dev/video0")
             self.status.setText("v4l2-ctl not found; install v4l-utils for full functionality.")
             return
         devs = list_v4l2_devices()
         if not devs:
-            self.device_combo.addItem("/dev/video0 (no devices found)","/dev/video0")
+            self.device_combo.addItem("/dev/video0 (no devices found)", "/dev/video0")
             self.status.setText("No v4l2 devices found.")
             return
         for name, paths in devs.items():
@@ -309,15 +410,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if v4l2_available():
             fmts = list_formats(dev)
             if fmts:
-                for fcc,w,h in fmts:
-                    self.res_combo.addItem(f"{w}x{h} ({fcc})", (w,h))
+                for fcc, w, h in fmts:
+                    self.res_combo.addItem(f"{w}x{h} ({fcc})", (w, h))
             else:
-                self.res_combo.addItem("1280x720",(1280,720))
+                self.res_combo.addItem("1280x720", (1280, 720))
         else:
-            self.res_combo.addItem("1280x720",(1280,720))
+            self.res_combo.addItem("1280x720", (1280, 720))
         self._build_controls_for_device(dev)
 
-    # ---- dynamic controls builder ----
+    # ----------------- dynamic controls -----------------
     def _clear_controls_ui(self):
         while self.ctrl_layout.count():
             item = self.ctrl_layout.takeAt(0)
@@ -331,7 +432,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not v4l2_available():
             self.status.setText("v4l2-ctl missing; cannot enumerate controls.")
             return
-        raw = run_cmd(["v4l2-ctl","--device", dev, "--list-ctrls"])
+        raw = run_cmd(["v4l2-ctl", "--device", dev, "--list-ctrls"])
         if not raw:
             self.status.setText("No controls returned by v4l2-ctl.")
             return
@@ -339,82 +440,116 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ctrls:
             self.status.setText("Failed to parse controls.")
             return
+        self._last_ctrls = ctrls
 
         preferred_order = [
-            'brightness','contrast','saturation','hue',
-            'white_balance_automatic','white_balance_temperature','gamma','power_line_frequency',
-            'sharpness','backlight_compensation',
-            'auto_exposure','exposure_time_absolute','exposure_dynamic_framerate',
-            'pan_absolute','tilt_absolute','zoom_absolute'
+            'brightness', 'contrast', 'saturation', 'hue',
+            'white_balance_automatic', 'white_balance_temperature', 'gamma', 'power_line_frequency',
+            'sharpness', 'backlight_compensation',
+            'auto_exposure', 'exposure_time_absolute', 'exposure_dynamic_framerate',
+            'pan_absolute', 'tilt_absolute', 'zoom_absolute'
         ]
 
         def add_control(norm_key, info):
             disp_name = info.get('name', norm_key)
-            typ = info.get('type','').lower()
-            row_w = QtWidgets.QWidget(); row = QtWidgets.QHBoxLayout(row_w); row.setContentsMargins(6,4,6,4)
+            typ = info.get('type', '').lower()
+            row_w = QtWidgets.QWidget(); row = QtWidgets.QHBoxLayout(row_w); row.setContentsMargins(6, 4, 6, 4)
             lbl = QtWidgets.QLabel(disp_name); lbl.setMinimumWidth(200); row.addWidget(lbl)
 
             meta = {'orig_name': info.get('name', norm_key), 'type': typ}
             inactive = False
             if 'flags' in info and str(info.get('flags')).lower() == 'inactive':
                 inactive = True
-            if 'inactive' in str(info.get('raw','')).lower():
+            if 'inactive' in str(info.get('raw', '')).lower():
                 inactive = True
 
             if 'int' in typ:
-                minv = int(info.get('min',0)); maxv = int(info.get('max', minv+1000)); cur = info.get('value', minv)
-                try: cur_i = int(cur)
-                except: cur_i = minv
-                slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); slider.setMinimum(0); slider.setMaximum(maxv-minv); slider.setValue(cur_i-minv); slider.setEnabled(not inactive)
-                val_label = QtWidgets.QLabel(str(cur_i)); val_label.setMinimumWidth(80)
-                row.addWidget(slider, stretch=1); row.addWidget(val_label)
+                minv = int(info.get('min', 0)); maxv = int(info.get('max', minv + 1000)); cur = info.get('value', minv)
+                try:
+                    cur_i = int(cur)
+                except:
+                    cur_i = minv
+                slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); slider.setMinimum(0); slider.setMaximum(maxv - minv); slider.setValue(cur_i - minv); slider.setEnabled(not inactive)
+                val_spin = QtWidgets.QSpinBox()
+                val_spin.setRange(minv, maxv)
+                val_spin.setValue(cur_i)
+                val_spin.setMinimumWidth(90)
+                val_spin.setEnabled(not inactive)
+
+                # make spin expand vertically less; layout handles width
+                row.addWidget(slider, stretch=1); row.addWidget(val_spin)
                 self.ctrl_layout.addWidget(row_w)
-                meta.update({'min':minv,'max':maxv,'widget':slider,'val_label':val_label,'inactive':inactive})
+                meta.update({'min': minv, 'max': maxv, 'widget': slider, 'val_label': val_spin, 'inactive': inactive})
 
                 def on_slider(v, nk=norm_key):
                     m = self._ctrl_widgets.get(nk)
                     if not m: return
-                    actual = v + m['min']
+                    actual = int(v + m['min'])
+                    spin: QtWidgets.QSpinBox = m['val_label']
+                    if spin.value() != actual:
+                        spin.blockSignals(True)
+                        spin.setValue(actual)
+                        spin.blockSignals(False)
                     ok = set_ctrl(dev, m['orig_name'], actual)
-                    if ok:
-                        m['val_label'].setText(str(actual))
-                    else:
+                    if not ok:
                         self.status.setText(f"Failed to set {m['orig_name']} -> {actual}")
                 slider.valueChanged.connect(on_slider)
+
+                def on_spin(v, nk=norm_key):
+                    m = self._ctrl_widgets.get(nk)
+                    if not m: return
+                    try:
+                        val = int(v)
+                    except Exception:
+                        return
+                    slider_widget: QtWidgets.QSlider = m['widget']
+                    desired_slider = val - m['min']
+                    if slider_widget.value() != desired_slider:
+                        slider_widget.blockSignals(True)
+                        slider_widget.setValue(desired_slider)
+                        slider_widget.blockSignals(False)
+                    ok = set_ctrl(dev, m['orig_name'], val)
+                    if not ok:
+                        self.status.setText(f"Failed to set {m['orig_name']} -> {val}")
+                val_spin.valueChanged.connect(on_spin)
+
                 self._ctrl_widgets[norm_key] = meta
 
             elif 'bool' in typ:
-                cur = info.get('value',0)
-                try: cur_b = bool(int(cur))
-                except: cur_b = bool(cur)
+                cur = info.get('value', 0)
+                try:
+                    cur_b = bool(int(cur))
+                except:
+                    cur_b = bool(cur)
                 chk = QtWidgets.QCheckBox(); chk.setChecked(cur_b); chk.setEnabled(not inactive)
                 row.addWidget(chk); row.addStretch(1); self.ctrl_layout.addWidget(row_w)
-                meta.update({'widget':chk,'inactive':inactive})
+                meta.update({'widget': chk, 'inactive': inactive})
                 def on_chk(state, nk=norm_key):
-                    m = self._ctrl_widgets.get(nk); 
+                    m = self._ctrl_widgets.get(nk)
                     if not m: return
                     val = 1 if state else 0
                     ok = set_ctrl(dev, m['orig_name'], val)
                     if not ok:
                         self.status.setText(f"Failed to set {m['orig_name']} -> {val}")
                     else:
-                        if nk in ('white_balance_automatic','auto_exposure'):
+                        if nk in ('white_balance_automatic', 'auto_exposure'):
                             QtCore.QTimer.singleShot(200, lambda: self._build_controls_for_device(dev))
                 chk.stateChanged.connect(on_chk)
                 self._ctrl_widgets[norm_key] = meta
 
             elif 'menu' in typ:
-                minv = int(info.get('min',0)); maxv = int(info.get('max',minv)); cur = int(info.get('value',minv)); value_label = info.get('value_label')
+                minv = int(info.get('min', 0)); maxv = int(info.get('max', minv)); cur = int(info.get('value', minv)); value_label = info.get('value_label')
                 combo = QtWidgets.QComboBox()
-                for v in range(minv, maxv+1):
+                for v in range(minv, maxv + 1):
                     entry = str(v)
-                    if v==cur and value_label: entry = f"{v} ({value_label})"
+                    if v == cur and value_label:
+                        entry = f"{v} ({value_label})"
                     combo.addItem(entry, v)
-                combo.setCurrentIndex(cur-minv); combo.setEnabled(not inactive)
+                combo.setCurrentIndex(cur - minv); combo.setEnabled(not inactive)
                 row.addWidget(combo, stretch=1); row.addStretch(0); self.ctrl_layout.addWidget(row_w)
-                meta.update({'min':minv,'max':maxv,'widget':combo,'inactive':inactive})
+                meta.update({'min': minv, 'max': maxv, 'widget': combo, 'inactive': inactive})
                 def on_combo(idx, nk=norm_key):
-                    m = self._ctrl_widgets.get(nk); 
+                    m = self._ctrl_widgets.get(nk)
                     if not m: return
                     val = m['widget'].currentData()
                     ok = set_ctrl(dev, m['orig_name'], val)
@@ -426,7 +561,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._ctrl_widgets[norm_key] = meta
 
             else:
-                row.addWidget(QtWidgets.QLabel(str(info.get('value','')))); self.ctrl_layout.addWidget(row_w)
+                row.addWidget(QtWidgets.QLabel(str(info.get('value', '')))); self.ctrl_layout.addWidget(row_w)
                 meta.update({'widget': None, 'inactive': True})
                 self._ctrl_widgets[norm_key] = meta
 
@@ -441,12 +576,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ctrl_layout.addStretch(1)
         self.status.setText("Controls loaded.")
 
-    # ---- preview start/stop ----
+    # ----------------- preview start/stop -----------------
     def _on_start_clicked(self):
         dev = self.device_combo.currentData(); res = self.res_combo.currentData()
         if not dev or not res:
             self.status.setText("Select a device and resolution first."); return
-        w,h = res
+        w, h = res
         idx = self._devpath_to_index(dev)
         if idx is None:
             self.status.setText(f"Cannot parse device index from {dev}"); return
@@ -457,8 +592,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setText("Preview started.")
 
     def _on_stop_clicked(self):
+        if self.recording:
+            self._stop_recording()
+
         if self.timer.isActive(): self.timer.stop()
-        if self.worker: self.worker.stop(); self.worker=None
+        if self.worker: self.worker.stop(); self.worker = None
         self.video_label.clear(); self.btn_start.setEnabled(True); self.btn_stop.setEnabled(False); self.btn_save.setEnabled(False)
         self.status.setText("Preview stopped.")
 
@@ -467,15 +605,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_frame(self, frame: np.ndarray):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h,w,ch = rgb.shape; bytes_per_line = ch * w
+        h, w, ch = rgb.shape; bytes_per_line = ch * w
         qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg).scaled(self.video_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
         self.video_label.setPixmap(pix); self.current_frame = frame
 
-    def _on_worker_error(self, text: str):
-        self.status.setText("Camera error: "+str(text)); self._on_stop_clicked()
+        # handle recording
+        if self.recording:
+            fmt = self.rec_format.lower()
+            if fmt in ('mp4', 'avi'):
+                if self.rec_writer is not None:
+                    try:
+                        self.rec_writer.write(frame)
+                    except Exception as e:
+                        self.status.setText(f"Recording write error: {e}")
+            elif fmt == 'gif':
+                if _HAS_IMAGEIO:
+                    self.rec_frames.append(rgb.copy())
+                else:
+                    self.status.setText("imageio not available: cannot record GIF. Stop recording.")
+                    self._stop_recording()
 
-    # ---- FPS ----
+    def _on_worker_error(self, text: str):
+        self.status.setText("Camera error: " + str(text)); self._on_stop_clicked()
+
+    # ----------------- FPS -----------------
     def _on_set_fps(self):
         dev = self.device_combo.currentData()
         if not dev: self.status.setText("Select device first."); return
@@ -492,8 +646,9 @@ class MainWindow(QtWidgets.QMainWindow):
         parts.append("set-parm OK" if success_v4l2 else "set-parm failed")
         parts.append("OpenCV FPS set OK" if success_cv else "OpenCV FPS set failed")
         self.lbl_fps_status.setText(", ".join(parts)); self.status.setText(f"Requested FPS={fps}. {', '.join(parts)}")
+        self._save_settings()
 
-    # ---- burst capture ----
+    # ----------------- burst capture -----------------
     def _on_start_burst(self):
         if self.worker is None or self.worker.cap is None:
             self.status.setText("Start preview before burst capture."); return
@@ -503,10 +658,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self._burst_prefix = f"burst_{ts}"
         self._burst_remaining = count
-        # disable conflicting UI
         self.btn_start_burst.setEnabled(False); self.btn_start.setEnabled(False); self.btn_stop.setEnabled(False); self.btn_save.setEnabled(False); self.btn_browse.setEnabled(False)
         self.status.setText(f"Starting burst: {count} frames every {interval} ms"); self.lbl_burst_status.setText(f"{self._burst_remaining} remaining")
-        # timer for burst
         self._burst_timer = QtCore.QTimer(); self._burst_timer.setInterval(interval); self._burst_timer.timeout.connect(self._on_burst_tick)
         QtCore.QTimer.singleShot(0, self._on_burst_tick)
         self._burst_timer.start()
@@ -534,7 +687,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start_burst.setEnabled(True); self.btn_start.setEnabled(True); self.btn_stop.setEnabled(True); self.btn_save.setEnabled(True if self.current_frame is not None else False); self.btn_browse.setEnabled(True)
         self.lbl_burst_status.setText("Burst complete"); self.status.setText("Burst capture finished.")
 
-    # ---- single save ----
+    # ----------------- single save -----------------
     def _on_save_frame(self):
         if self.current_frame is None:
             self.status.setText("No frame to save."); return
@@ -544,7 +697,175 @@ class MainWindow(QtWidgets.QMainWindow):
         cv2.imwrite(fname, self.current_frame)
         self.status.setText(f"Saved {fname}")
 
-    # ---- save folder UI ----
+    # ----------------- recording -----------------
+    def _on_record_toggle(self):
+        if not self.recording:
+            if self.worker is None or self.worker.cap is None:
+                self.status.setText("Start preview before recording."); return
+            fmt = self.rec_format_combo.currentText().lower()
+            pat = self.le_record_pattern.text().strip() or f"recording_{{timestamp:%Y%m%d_%H%M%S}}.{fmt}"
+            folder = self._ensure_save_folder()
+            fname = os.path.join(folder, self._fill_pattern(pat, index=0, count=1))
+            if not fname.lower().endswith(f".{fmt}"):
+                fname = fname + f".{fmt}"
+            w, h = int(self.res_combo.currentData()[0]), int(self.res_combo.currentData()[1])
+            fps = int(self.fps_spin.value())
+            self._save_settings()
+            if fmt in ('mp4', 'avi'):
+                if fmt == 'mp4':
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                else:
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                try:
+                    writer = cv2.VideoWriter(fname, fourcc, float(fps), (w, h))
+                    if not writer or not writer.isOpened():
+                        self.status.setText(f"Failed to open writer for {fname}")
+                        return
+                    self.rec_writer = writer
+                    self.rec_format = fmt
+                    self.rec_path = fname
+                    self.recording = True
+                    self.rec_start_time = time.time()
+                    self.rec_frames = []
+                    self.btn_record.setText("Stop Recording")
+                    self.lbl_record_status.setText(f"Recording to {fname}")
+                    self.lbl_rec_duration.setText("Duration: 00:00:00")
+                    self.lbl_rec_filesize.setText("Size: 0 B")
+                    self.lbl_rec_est.setText("Est: calculating...")
+                    self.rec_timer.start()
+                    self.status.setText(f"Recording started: {fname}")
+                except Exception as e:
+                    self.status.setText(f"Failed to start recording: {e}")
+            elif fmt == 'gif':
+                if not _HAS_IMAGEIO:
+                    self.status.setText("imageio required for GIF recording but not available.")
+                    return
+                self.rec_format = fmt
+                self.rec_frames = []
+                self.rec_path = fname
+                self.recording = True
+                self.rec_start_time = time.time()
+                self.btn_record.setText("Stop Recording")
+                self.lbl_record_status.setText(f"Recording GIF to {fname}")
+                self.lbl_rec_duration.setText("Duration: 00:00:00")
+                self.lbl_rec_filesize.setText("Size: 0 B")
+                self.lbl_rec_est.setText("Est: calculating...")
+                self.rec_timer.start()
+                self.status.setText(f"Recording (GIF) started: {fname}")
+            else:
+                self.status.setText(f"Unsupported format: {fmt}")
+        else:
+            self._stop_recording()
+
+    def _on_record_tick(self):
+        if not self.recording:
+            return
+        elapsed = int(time.time() - (self.rec_start_time or time.time()))
+        h = elapsed // 3600; m = (elapsed % 3600) // 60; s = elapsed % 60
+        self.lbl_rec_duration.setText(f"Duration: {h:02d}:{m:02d}:{s:02d}")
+        if self.rec_path and os.path.exists(self.rec_path):
+            try:
+                size = os.path.getsize(self.rec_path)
+                self.lbl_rec_filesize.setText(f"Size: {self._sizeof(size)}")
+            except Exception:
+                self.lbl_rec_filesize.setText("Size: unknown")
+        else:
+            self.lbl_rec_filesize.setText("Size: 0 B")
+        if self.rec_format in ('mp4', 'avi'):
+            fps = int(self.fps_spin.value())
+            elapsed_f = max(1, elapsed)
+            w, h = int(self.res_combo.currentData()[0]), int(self.res_combo.currentData()[1])
+            frames_est = elapsed_f * fps
+            raw_bytes = frames_est * w * h * 3
+            self.lbl_rec_est.setText(f"Est raw: {self._sizeof(raw_bytes)}")
+        elif self.rec_format == 'gif':
+            self.lbl_rec_est.setText(f"Frames: {len(self.rec_frames)}")
+
+    def _stop_recording(self):
+        if not self.recording:
+            return
+        fmt = self.rec_format.lower()
+        self.rec_timer.stop()
+        if fmt in ('mp4', 'avi'):
+            try:
+                if self.rec_writer is not None:
+                    self.rec_writer.release()
+                    self.rec_writer = None
+                    self.status.setText(f"Recording saved: {self.rec_path}")
+                    self.lbl_record_status.setText(f"Saved: {self.rec_path}")
+            except Exception as e:
+                self.status.setText(f"Error closing writer: {e}")
+        elif fmt == 'gif':
+            if _HAS_IMAGEIO and self.rec_frames:
+                self.lbl_record_status.setText("Finalizing GIF...")
+                self.gif_worker = GifSaverWorker(self.rec_frames.copy(), self.rec_path, fps=int(self.fps_spin.value()))
+                self._gif_progress = QtWidgets.QProgressDialog("Saving GIF...", "Cancel", 0, max(1, len(self.rec_frames)), self)
+                self._gif_progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+                self._gif_progress.setAutoClose(False)
+                self._gif_progress.setValue(0)
+                self.gif_worker.progress.connect(self._on_gif_progress)
+                self.gif_worker.finished.connect(self._on_gif_finished)
+                self._gif_progress.canceled.connect(self._on_gif_cancel)
+                self.gif_worker.start()
+            else:
+                if not _HAS_IMAGEIO:
+                    self.status.setText("imageio not available; GIF not saved.")
+                else:
+                    self.status.setText("No frames recorded; GIF not saved.")
+        if fmt in ('mp4', 'avi'):
+            self.recording = False
+            self.rec_format = "mp4"
+            self.rec_writer = None
+            self.rec_frames = []
+            self.rec_path = ""
+            self.rec_start_time = None
+            self.btn_record.setText("Start Recording")
+            self.lbl_record_status.setText("")
+            self.lbl_rec_duration.setText("Duration: 00:00:00")
+            self.lbl_rec_filesize.setText("Size: 0 B")
+            self.lbl_rec_est.setText("Est: 0 B")
+            self._save_settings()
+
+    def _on_gif_progress(self, current: int, total: int):
+        if hasattr(self, "_gif_progress"):
+            self._gif_progress.setMaximum(total)
+            self._gif_progress.setValue(current)
+            self._gif_progress.setLabelText(f"Saving GIF... ({current}/{total})")
+
+    def _on_gif_finished(self, success: bool, message: str):
+        if hasattr(self, "_gif_progress"):
+            self._gif_progress.close()
+        self.status.setText(message)
+        self.lbl_record_status.setText(message if success else "GIF save failed")
+        self.recording = False
+        self.rec_format = "mp4"
+        self.rec_writer = None
+        self.rec_frames = []
+        self.rec_path = ""
+        self.rec_start_time = None
+        self.btn_record.setText("Start Recording")
+        self.lbl_rec_duration.setText("Duration: 00:00:00")
+        self.lbl_rec_filesize.setText("Size: 0 B")
+        self.lbl_rec_est.setText("Est: 0 B")
+        self._save_settings()
+
+    def _on_gif_cancel(self):
+        if self.gif_worker and self.gif_worker.isRunning():
+            try:
+                self.gif_worker.terminate()
+            except Exception:
+                pass
+        if hasattr(self, "_gif_progress"):
+            self._gif_progress.close()
+        self.status.setText("GIF saving canceled.")
+        self.recording = False
+        self.rec_frames = []
+        self.rec_path = ""
+        self.btn_record.setText("Start Recording")
+        self.lbl_record_status.setText("GIF canceled")
+        self._save_settings()
+
+    # ----------------- save folder -----------------
     def _ensure_save_folder(self) -> str:
         folder = (self.le_save_folder.text().strip() or self.save_folder or os.getcwd())
         folder = os.path.expanduser(folder)
@@ -561,6 +882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder to save images", start)
         if folder:
             self.save_folder = os.path.abspath(folder); self.le_save_folder.setText(self.save_folder); self.status.setText(f"Save folder set to: {self.save_folder}")
+            self._save_settings()
 
     def _on_open_folder(self):
         folder = self.le_save_folder.text().strip() or self.save_folder or os.getcwd(); folder = os.path.expanduser(folder)
@@ -578,20 +900,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.status.setText(f"Failed to open folder: {e}")
 
-    # ---- pattern filling helper ----
+    # ----------------- pattern filling -----------------
     _token_re = re.compile(r'\{([^:{}]+)(?::([^{}]+))?\}')
 
     def _fill_pattern(self, pattern: str, index: int = 0, count: int = 1) -> str:
-        """
-        Replace tokens in `pattern`.
-        Supports:
-          {timestamp} or {timestamp:%Y%m%d_%H%M%S}
-          {index} or {index:03d}
-          {count} or {count:03d}
-          {exposure} optionally with format
-          {gain}
-        Unknown tokens are left as-is (but braces are removed).
-        """
         def repl(m):
             name = m.group(1)
             fmt = m.group(2)
@@ -602,7 +914,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     return datetime.datetime.now().strftime(fmt_str)
                 if name_l == 'index':
                     if fmt:
-                        # e.g. fmt "03d" -> format(index, "03d")
                         try:
                             return format(index, fmt)
                         except Exception:
@@ -623,58 +934,102 @@ class MainWindow(QtWidgets.QMainWindow):
                         except: return str(v)
                     return str(v)
                 if name_l == 'gain':
-                    v = self._get_ctrl_value_by_names(['gain','analogue_gain'])
+                    v = self._get_ctrl_value_by_names(['gain', 'analogue_gain'])
                     if v is None: return "NA"
                     if fmt:
                         try: return format(int(v), fmt)
                         except: return str(v)
                     return str(v)
-                # fallback: if there's a control with this name directly, try to get it
                 v = self._get_ctrl_value_by_names([name_l])
                 if v is not None:
                     if fmt:
                         try: return format(int(v), fmt)
                         except: return str(v)
                     return str(v)
-                # unknown token -> return empty or keep raw? keep a safe placeholder:
                 return ""
             except Exception:
                 return ""
-
         result = self._token_re.sub(repl, pattern)
-        # sanitize filename (optional): remove characters disallowed in filenames on many platforms
-        # keep it simple: replace trailing / or backslash
-        result = result.replace('/', '_').replace('\\','_')
+        result = result.replace('/', '_').replace('\\', '_')
         return result
 
     def _get_ctrl_value_by_names(self, candidate_names: List[str]) -> Optional[Any]:
-        """
-        Attempt to read value from controls UI (self._ctrl_widgets).
-        candidate_names: list of normalized keys to try in order.
-        Returns int/str or None.
-        """
         for n in candidate_names:
             if n in self._ctrl_widgets:
                 meta = self._ctrl_widgets[n]
                 widget = meta.get('widget')
-                # if integer slider with val_label
                 if 'val_label' in meta:
                     try:
-                        return int(meta['val_label'].text())
+                        spin = meta['val_label']
+                        try:
+                            return int(spin.value())
+                        except Exception:
+                            return int(spin.text())
                     except Exception:
-                        return meta['val_label'].text()
-                # slider only
+                        return meta['val_label'].text() if hasattr(meta['val_label'], 'text') else None
                 if isinstance(widget, QtWidgets.QSlider):
-                    try: return widget.value() + meta.get('min',0)
+                    try: return widget.value() + meta.get('min', 0)
                     except: return widget.value()
                 if isinstance(widget, QtWidgets.QCheckBox):
                     return 1 if widget.isChecked() else 0
                 if isinstance(widget, QtWidgets.QComboBox):
                     return widget.currentData()
-                # else no widget readable
         return None
 
-    # ---- utility ----
+    # ----------------- reset to defaults -----------------
+    def _on_reset_to_defaults(self):
+        dev = self.device_combo.currentData()
+        if not dev:
+            self.status.setText("Select device first.")
+            return
+        if not self._last_ctrls:
+            self.status.setText("No control metadata available to reset.")
+            return
+        missing_defaults = []
+        changed = 0
+        for norm_key, info in self._last_ctrls.items():
+            if 'default' in info:
+                default_val = info['default']
+                ctrl_name = info['name']
+                ok = set_ctrl(dev, ctrl_name, default_val)
+                if ok:
+                    if norm_key in self._ctrl_widgets:
+                        meta = self._ctrl_widgets[norm_key]
+                        if 'val_label' in meta:
+                            spin = meta['val_label']
+                            spin.blockSignals(True)
+                            try: spin.setValue(int(default_val))
+                            except: spin.setValue(spin.minimum())
+                            spin.blockSignals(False)
+                            slider = meta['widget']
+                            slider.blockSignals(True)
+                            try: slider.setValue(int(default_val) - meta.get('min', 0))
+                            except: slider.setValue(0)
+                            slider.blockSignals(False)
+                        elif isinstance(meta.get('widget'), QtWidgets.QComboBox):
+                            combo: QtWidgets.QComboBox = meta['widget']
+                            idx_found = 0
+                            for i in range(combo.count()):
+                                if combo.itemData(i) == default_val:
+                                    idx_found = i; break
+                            combo.blockSignals(True)
+                            combo.setCurrentIndex(idx_found)
+                            combo.blockSignals(False)
+                        elif isinstance(meta.get('widget'), QtWidgets.QCheckBox):
+                            chk: QtWidgets.QCheckBox = meta['widget']
+                            chk.blockSignals(True)
+                            try: chk.setChecked(bool(int(default_val)))
+                            except: chk.setChecked(bool(default_val))
+                            chk.blockSignals(False)
+                    changed += 1
+                else:
+                    missing_defaults.append(ctrl_name)
+            else:
+                missing_defaults.append(info.get('name', norm_key))
+        self.status.setText(f"Reset {changed} controls to defaults. Skipped {len(missing_defaults)} (no default info).")
+        QtCore.QTimer.singleShot(300, lambda: self._build_controls_for_device(dev))
+
+    # ----------------- utility -----------------
     @staticmethod
     def _devpath_to_index(devpath: str) -> Optional[int]:
         m = re.search(r'video(\d+)', devpath)
@@ -685,6 +1040,15 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return None
 
+    @staticmethod
+    def _sizeof(num: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if num < 1024.0:
+                return f"{num:3.1f} {unit}"
+            num /= 1024.0
+        return f"{num:.1f} PB"
+
+# ----------------- main -----------------
 def main():
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
@@ -693,4 +1057,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
